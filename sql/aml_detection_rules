@@ -1,0 +1,252 @@
+-- ============================================================
+-- AML TRANSACTION MONITORING RULE ENGINE
+-- Author: Shravan
+-- Dataset: SAML-D Synthetic AML Transaction Dataset (Kaggle)
+-- Tools: MySQL
+-- Purpose: Detect financial crime red flag patterns including
+--          structuring, layering, cross-border risk, and
+--          behavioural changes using SQL detection rules
+-- ============================================================
+
+USE aml_project;
+
+-- ============================================================
+-- RULE 1: STRUCTURING DETECTION
+-- Finds accounts sending multiple transactions below 10,000
+-- on the same day with a suspicious total above 20,000
+-- Red flag: deliberately keeping transactions under threshold
+-- ============================================================
+
+CREATE OR REPLACE VIEW rule1_structuring AS
+SELECT 
+    Sender_account,
+    Date,
+    COUNT(*) AS transaction_count,
+    SUM(Amount) AS total_amount_sent,
+    MAX(Amount) AS largest_single_txn,
+    MIN(Amount) AS smallest_single_txn,
+    'STRUCTURING' AS alert_type,
+    CASE
+        WHEN SUM(Amount) > 50000 THEN 'CRITICAL'
+        WHEN SUM(Amount) > 30000 THEN 'HIGH'
+        ELSE 'MEDIUM'
+    END AS risk_level
+FROM transactions_sample
+WHERE Amount < 10000
+GROUP BY Sender_account, Date
+HAVING COUNT(*) >= 3
+AND SUM(Amount) > 20000
+ORDER BY total_amount_sent DESC;
+
+
+-- ============================================================
+-- RULE 2: SMURFING DETECTION
+-- Finds receiver accounts collecting money from 3 or more
+-- different senders on the same day, each under 10,000
+-- Red flag: coordinated small deposits to one account
+-- ============================================================
+
+CREATE OR REPLACE VIEW rule2_smurfing AS
+SELECT 
+    Receiver_account,
+    Date,
+    COUNT(DISTINCT Sender_account) AS unique_senders,
+    COUNT(*) AS total_transactions,
+    SUM(Amount) AS total_received,
+    AVG(Amount) AS avg_transaction_amount,
+    'SMURFING' AS alert_type,
+    CASE
+        WHEN COUNT(DISTINCT Sender_account) >= 5 THEN 'CRITICAL'
+        WHEN COUNT(DISTINCT Sender_account) >= 4 THEN 'HIGH'
+        ELSE 'MEDIUM'
+    END AS risk_level
+FROM transactions_sample
+WHERE Amount < 10000
+GROUP BY Receiver_account, Date
+HAVING COUNT(DISTINCT Sender_account) >= 3
+AND SUM(Amount) > 20000
+ORDER BY total_received DESC;
+
+
+-- ============================================================
+-- RULE 3: LAYERING DETECTION (PASS THROUGH ACCOUNTS)
+-- Finds accounts that both sent and received large amounts
+-- on the same day with very little difference between the two
+-- Red flag: account being used as a pass-through to hide trail
+-- ============================================================
+
+CREATE OR REPLACE VIEW rule3_layering AS
+WITH sent AS (
+    SELECT 
+        Sender_account AS account,
+        Date,
+        SUM(Amount) AS total_sent,
+        COUNT(*) AS sent_count
+    FROM transactions_sample
+    GROUP BY Sender_account, Date
+),
+received AS (
+    SELECT 
+        Receiver_account AS account,
+        Date,
+        SUM(Amount) AS total_received,
+        COUNT(*) AS received_count
+    FROM transactions_sample
+    GROUP BY Receiver_account, Date
+)
+SELECT 
+    sent.account,
+    sent.Date,
+    sent.total_sent,
+    received.total_received,
+    sent.sent_count,
+    received.received_count,
+    ABS(sent.total_sent - received.total_received) AS net_flow,
+    'LAYERING' AS alert_type,
+    CASE
+        WHEN ABS(sent.total_sent - received.total_received) < 1000
+        AND sent.total_sent > 10000 THEN 'CRITICAL'
+        WHEN ABS(sent.total_sent - received.total_received) < 5000
+        AND sent.total_sent > 5000 THEN 'HIGH'
+        ELSE 'MEDIUM'
+    END AS risk_level
+FROM sent
+INNER JOIN received
+    ON sent.account = received.account
+    AND sent.Date = received.Date
+WHERE sent.total_sent > 5000
+AND received.total_received > 5000
+ORDER BY net_flow ASC;
+
+-- ============================================================
+-- RULE 4: CROSS BORDER RISK DETECTION
+-- Flags transactions involving high risk countries
+-- Red flag: unusual cross border activity to known high risk
+-- jurisdictions inconsistent with customer profile
+-- ============================================================
+
+CREATE OR REPLACE VIEW rule4_crossborder AS
+SELECT 
+    Sender_account,
+    Receiver_account,
+    Amount,
+    Date,
+    Sender_bank_location,
+    Receiver_bank_location,
+    Payment_type,
+    Laundering_type,
+    'CROSS BORDER RISK' AS alert_type,
+    CASE
+        WHEN Amount > 50000
+        AND Receiver_bank_location IN ('Nigeria','Pakistan','Morocco','Albania')
+        THEN 'CRITICAL'
+        WHEN Amount > 10000
+        AND Receiver_bank_location IN ('Nigeria','Pakistan','Morocco','Albania')
+        THEN 'HIGH'
+        WHEN Receiver_bank_location IN ('Nigeria','Pakistan','Morocco','Albania')
+        THEN 'MEDIUM'
+        ELSE 'LOW'
+    END AS risk_level
+FROM transactions_sample
+WHERE Sender_bank_location != Receiver_bank_location
+ORDER BY Amount DESC;
+
+-- ============================================================
+-- RULE 5: BEHAVIOURAL CHANGE DETECTION
+-- Finds accounts whose daily transaction total suddenly
+-- spikes compared to their previous day activity
+-- Red flag: sudden unexplained increase in transaction volume
+-- ============================================================
+
+CREATE OR REPLACE VIEW rule5_behavioural_change AS
+WITH account_daily AS (
+    SELECT 
+        Sender_account,
+        Date,
+        SUM(Amount) AS daily_total,
+        COUNT(*) AS daily_count
+    FROM transactions_sample
+    GROUP BY Sender_account, Date
+)
+SELECT 
+    Sender_account,
+    Date,
+    daily_total,
+    daily_count,
+    LAG(daily_total) OVER (
+        PARTITION BY Sender_account
+        ORDER BY Date
+    ) AS previous_day_total,
+    daily_total - LAG(daily_total) OVER (
+        PARTITION BY Sender_account
+        ORDER BY Date
+    ) AS change_from_previous_day,
+    'BEHAVIOURAL CHANGE' AS alert_type,
+    CASE
+        WHEN daily_total > 3 * LAG(daily_total) OVER (
+            PARTITION BY Sender_account
+            ORDER BY Date
+        ) THEN 'CRITICAL'
+        WHEN daily_total > 2 * LAG(daily_total) OVER (
+            PARTITION BY Sender_account
+            ORDER BY Date
+        ) THEN 'HIGH'
+        ELSE 'NORMAL'
+    END AS behavioural_flag
+FROM account_daily
+ORDER BY Sender_account, Date;
+
+-- ============================================================
+-- MASTER ALERT VIEW
+-- Combines all rules into one unified alert table
+-- This is what an investigator would see in a real system
+-- ============================================================
+
+CREATE OR REPLACE VIEW master_alerts AS
+
+SELECT 
+    Sender_account AS account,
+    Date,
+    total_amount_sent AS amount,
+    alert_type,
+    risk_level
+FROM rule1_structuring
+
+UNION ALL
+
+SELECT 
+    Receiver_account AS account,
+    Date,
+    total_received AS amount,
+    alert_type,
+    risk_level
+FROM rule2_smurfing
+
+UNION ALL
+
+SELECT 
+    account,
+    Date,
+    total_sent AS amount,
+    alert_type,
+    risk_level
+FROM rule3_layering
+
+UNION ALL
+
+SELECT 
+    Sender_account AS account,
+    Date,
+    Amount,
+    alert_type,
+    risk_level
+FROM rule4_crossborder;
+
+
+
+SELECT * FROM rule1_structuring;
+SELECT * FROM rule2_smurfing;
+SELECT * FROM rule3_layering;
+SELECT * FROM rule4_crossborder;
+SELECT * FROM rule5_behavioural_change;
+SELECT * FROM master_alerts;
