@@ -79,7 +79,12 @@ aml-transaction-monitoring/
 │ └── rule5_behavioural_change.csv
 └── README.md
 
+
 ---
 
 ## About
 Built as part of a portfolio project targeting Financial Crime Analyst and AML Investigation roles. All data is fully synthetic — no real customer or transaction data is used anywhere in this project.
+
+
+## Dashboard Preview
+![AML Dashboard](aml_dashboard.png)
